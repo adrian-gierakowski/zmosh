@@ -15,8 +15,9 @@ pub const Tag = enum(u8) {
     History = 8,
     Run = 9,
     Ack = 10,
+    SessionEnd = 11,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (11-255) are representable
+    // @enumFromInt, so out-of-range values (12-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -219,4 +220,19 @@ pub fn probeSession(
         }
     }
     return error.Unexpected;
+}
+
+test "Tag enum values" {
+    try std.testing.expectEqual(@as(u8, 11), @intFromEnum(Tag.SessionEnd));
+}
+
+test "Header layout with SessionEnd tag" {
+    const header = Header{
+        .tag = .SessionEnd,
+        .len = 42,
+    };
+    const bytes = std.mem.asBytes(&header);
+    const parsed = std.mem.bytesToValue(Header, bytes[0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.SessionEnd, parsed.tag);
+    try std.testing.expectEqual(@as(u32, 42), parsed.len);
 }
