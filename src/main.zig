@@ -657,7 +657,7 @@ const Daemon = struct {
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
                 .{ cursor.x, cursor.y, cursor.pending_wrap },
             );
-            if (util.serializeTerminalState(self.alloc, term)) |term_output| {
+            if (util.serializeTerminalState(self.alloc, term, resize.rows)) |term_output| {
                 std.log.debug("serialize terminal state", .{});
                 defer self.alloc.free(term_output);
                 ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
@@ -1556,6 +1556,32 @@ fn clientLoop(client_sock_fd: i32) !void {
     }
 }
 
+const ScrollPreservingHandler = struct {
+    terminal: *ghostty_vt.Terminal,
+    clear_detected: bool = false,
+
+    pub fn init(terminal: *ghostty_vt.Terminal) ScrollPreservingHandler {
+        return .{ .terminal = terminal };
+    }
+
+    pub fn deinit(_: *ScrollPreservingHandler) void {}
+
+    pub fn vt(
+        self: *ScrollPreservingHandler,
+        comptime action: ghostty_vt.StreamAction.Tag,
+        value: ghostty_vt.StreamAction.Value(action),
+    ) !void {
+        if (comptime action == .erase_display_complete) {
+            if (self.terminal.screens.active_key == .primary) {
+                self.terminal.screens.active.scrollClear() catch {};
+                self.clear_detected = true;
+            }
+        }
+        var handler = self.terminal.vtHandler();
+        return handler.vt(action, value);
+    }
+};
+
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
 fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
@@ -1571,7 +1597,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         .max_scrollback = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
-    var vt_stream = term.vtStream();
+    var vt_stream: ghostty_vt.Stream(ScrollPreservingHandler) = .initAlloc(
+        daemon.alloc,
+        ScrollPreservingHandler.init(&term),
+    );
     defer vt_stream.deinit();
 
     daemon_loop: while (daemon.running) {
@@ -1659,6 +1688,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
+                    vt_stream.handler.clear_detected = false;
                     try vt_stream.nextSlice(buf[0..n]);
                     daemon.has_pty_output = true;
 
@@ -1686,6 +1716,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
                     // Broadcast data to all clients
                     for (daemon.clients.items) |client| {
+                        if (vt_stream.handler.clear_detected) {
+                            ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, "\x1b[22J") catch {};
+                        }
                         ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, buf[0..n]) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",

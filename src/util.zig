@@ -295,7 +295,7 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
-pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
@@ -310,9 +310,47 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         defer term.modes.set(.synchronized_output, true);
     }
 
-    var term_formatter = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
-    term_formatter.content = .{ .selection = null };
-    term_formatter.extra = .{
+    const screen = term.screens.active;
+
+    // Phase 1: Serialize scrollback history as content only (no cursor/modes).
+    // This flows into the client's scrollback buffer naturally.
+    if (screen.pages.getBottomRight(.history)) |history_br| {
+        const history_tl = screen.pages.getTopLeft(.history);
+        var hist_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+        hist_fmt.content = .{ .selection = ghostty_vt.Selection.init(history_tl, history_br, false) };
+        hist_fmt.extra = .{
+            .palette = false,
+            .modes = false,
+            .scrolling_region = false,
+            .tabstops = false,
+            .pwd = false,
+            .keyboard = false,
+            .screen = .none,
+        };
+        hist_fmt.format(&builder.writer) catch |err| {
+            std.log.warn("failed to format scrollback err={s}", .{@errorName(err)});
+            return null;
+        };
+        // Scroll visible history lines into the client's scrollback buffer.
+        // We push exactly min(history_rows, client_rows) newlines — enough to
+        // scroll rendered content off screen without inserting blank lines into
+        // the scrollback. Move cursor to the bottom first so each \n scrolls.
+        const history_rows = screen.pages.total_rows - screen.pages.rows;
+        const push_count: usize = @min(history_rows, @as(usize, client_rows));
+        builder.writer.writeAll("\x1b[999;1H") catch return null;
+        var i: usize = 0;
+        while (i < push_count) : (i += 1) {
+            builder.writer.writeAll("\n") catch return null;
+        }
+        builder.writer.writeAll("\x1b[H") catch return null;
+    }
+
+    // Phase 2: Serialize active screen with cursor position and terminal modes.
+    const active_tl = screen.pages.getTopLeft(.active);
+    const active_br = screen.pages.getBottomRight(.active) orelse return null;
+    var active_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+    active_fmt.content = .{ .selection = ghostty_vt.Selection.init(active_tl, active_br, false) };
+    active_fmt.extra = .{
         .palette = false,
         .modes = true,
         .scrolling_region = true,
@@ -322,8 +360,8 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         .screen = .all,
     };
 
-    term_formatter.format(&builder.writer) catch |err| {
-        std.log.warn("failed to format terminal state err={s}", .{@errorName(err)});
+    active_fmt.format(&builder.writer) catch |err| {
+        std.log.warn("failed to format active screen err={s}", .{@errorName(err)});
         return null;
     };
 
@@ -738,7 +776,7 @@ test "serializeTerminalState excludes synchronized output replay" {
     try std.testing.expect(term.modes.get(.bracketed_paste));
     try std.testing.expect(term.modes.get(.synchronized_output));
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, 24) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try std.testing.expect(term.modes.get(.synchronized_output));
