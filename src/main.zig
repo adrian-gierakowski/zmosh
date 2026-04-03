@@ -252,6 +252,7 @@ pub fn main() !void {
 const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
+    initialized: bool = false,
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -646,12 +647,12 @@ const Daemon = struct {
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
 
-        // Serialize terminal state BEFORE resize to capture correct cursor position.
-        // Resizing triggers reflow which can move the cursor, and the shell's
-        // SIGWINCH-triggered redraw will run after our snapshot is sent.
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
+        // Serialize terminal state BEFORE resize to capture the pre-reflow
+        // cursor position. We gate on has_pty_output so that the very first
+        // local attach (where the shell hasn't emitted anything yet) skips
+        // the snapshot, while a remote attach — where the shell may have been
+        // running since the gateway forked the daemon — gets a full replay.
+        if (self.has_pty_output) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
@@ -660,6 +661,14 @@ const Daemon = struct {
             if (util.serializeTerminalState(self.alloc, term, resize.rows)) |term_output| {
                 std.log.debug("serialize terminal state", .{});
                 defer self.alloc.free(term_output);
+                // Only clear on re-init. For first Init on a fresh socket,
+                // write_buf may contain queued non-Output replies (e.g. Info)
+                // from earlier messages in the same read batch.
+                if (client.initialized) {
+                    // Drop any stale output buffered before Init so the snapshot
+                    // is the first payload rendered after a resync request.
+                    client.write_buf.clearRetainingCapacity();
+                }
                 ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
                     std.log.warn(
                         "failed to buffer terminal state for client err={s}",
@@ -679,8 +688,7 @@ const Daemon = struct {
         _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
         try term.resize(self.alloc, resize.cols, resize.rows);
 
-        // Mark that we've had a client init, so subsequent clients get terminal state
-        self.has_had_client = true;
+        client.initialized = true;
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -1809,7 +1817,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 }
             }
 
-            if (revents & posix.POLL.OUT != 0) {
+            // A client can queue replies while handling POLL.IN (e.g. Init, Run, History, Info).
+            // Flush pending bytes immediately instead of waiting for another poll cycle.
+            if ((revents & posix.POLL.OUT != 0) or client.has_pending_output) {
                 // Flush pending output buffers
                 const n = posix.write(client.socket_fd, client.write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
