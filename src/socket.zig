@@ -28,6 +28,21 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
     return full;
 }
 
+pub fn getSocketDir(alloc: std.mem.Allocator) ![]const u8 {
+    const tmpdir = std.mem.trimRight(u8, posix.getenv("TMPDIR") orelse "/tmp", "/");
+    const uid = posix.getuid();
+
+    const socket_dir: []const u8 = if (posix.getenv("ZMX_DIR")) |zmxdir|
+        try alloc.dupe(u8, zmxdir)
+    else if (posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime|
+        try std.fmt.allocPrint(alloc, "{s}/zmx", .{xdg_runtime})
+    else
+        try std.fmt.allocPrint(alloc, "{s}/zmx-{d}", .{ tmpdir, uid });
+    errdefer alloc.free(socket_dir);
+
+    return socket_dir;
+}
+
 pub fn sessionConnect(sesh: []const u8) !i32 {
     var unix_addr = try std.net.Address.initUnix(sesh);
     const socket_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);

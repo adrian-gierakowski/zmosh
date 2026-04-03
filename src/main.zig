@@ -9,6 +9,7 @@ const completions = @import("completions.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const zmosh = if (build_options.enable_zmosh) @import("zmosh") else struct {};
 
 pub const version = build_options.version;
 pub const git_sha = build_options.git_sha;
@@ -35,6 +36,34 @@ var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false
 
 // https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/lib/std/posix.zig#L3505
 const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+
+fn setupDaemon(cfg: *Cfg, alloc: std.mem.Allocator, sesh: []const u8, command: ?[][]const u8) !Daemon {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.posix.getcwd(&cwd_buf) catch "";
+
+    const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+    var daemon = Daemon{
+        .running = true,
+        .cfg = cfg,
+        .alloc = alloc,
+        .clients = clients,
+        .session_name = sesh,
+        .socket_path = undefined,
+        .pid = undefined,
+        .command = command,
+        .cwd = cwd,
+        .created_at = @intCast(std.time.timestamp()),
+        .leader_client_fd = null,
+    };
+    daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(sesh, cfg.socket_dir);
+            return err;
+        },
+        error.OutOfMemory => return err,
+    };
+    return daemon;
+}
 
 pub fn main() !void {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
@@ -73,6 +102,17 @@ pub fn main() !void {
         const arg = args.next() orelse return;
         const shell = completions.Shell.fromString(arg) orelse return;
         return printCompletions(shell);
+    } else if (build_options.enable_zmosh and (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s"))) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        // Bootstrap the daemon similarly to local attach, then hand over
+        var daemon = try setupDaemon(&cfg, alloc, sesh, null);
+        const result = try daemon.ensureSession();
+        if (result.is_daemon) return;
+
+        return zmosh.serveMain(alloc, sesh);
     } else if (std.mem.eql(u8, cmd, "detach") or std.mem.eql(u8, cmd, "d")) {
         return detachAll(&cfg);
     } else if (std.mem.eql(u8, cmd, "history") or std.mem.eql(u8, cmd, "hi")) {
@@ -92,42 +132,40 @@ pub fn main() !void {
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
-        const session_name = args.next() orelse "";
+        var session_name: []const u8 = "";
+        var remote_host: ?[]const u8 = null;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
+
         while (args.next()) |arg| {
-            try command_args.append(alloc, arg);
+            if (build_options.enable_zmosh and (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r"))) {
+                remote_host = args.next();
+            } else if (session_name.len == 0) {
+                session_name = arg;
+            } else {
+                try command_args.append(alloc, arg);
+            }
         }
 
-        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
         var command: ?[][]const u8 = null;
         if (command_args.items.len > 0) {
             command = command_args.items;
         }
 
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.posix.getcwd(&cwd_buf) catch "";
-
         const sesh = try socket.getSeshName(alloc, session_name);
         defer alloc.free(sesh);
-        var daemon = Daemon{
-            .running = true,
-            .cfg = &cfg,
-            .alloc = alloc,
-            .clients = clients,
-            .session_name = sesh,
-            .socket_path = undefined,
-            .pid = undefined,
-            .command = command,
-            .cwd = cwd,
-            .created_at = @intCast(std.time.timestamp()),
-            .leader_client_fd = null,
-        };
-        daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
-            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
-            error.OutOfMemory => return err,
-        };
+
+        if (remote_host) |host| {
+            if (build_options.enable_zmosh) {
+                const session = try zmosh.connectRemote(alloc, host, sesh);
+                return zmosh.remoteAttach(alloc, session);
+            } else {
+                @panic("zmx was not built with zmosh support");
+            }
+        }
+
+        var daemon = try setupDaemon(&cfg, alloc, sesh, command);
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(&daemon);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
@@ -273,7 +311,7 @@ const Cfg = struct {
     max_scrollback: usize = 10_000_000,
 
     pub fn init(alloc: std.mem.Allocator) !Cfg {
-        const socket_dir = try socketDir(alloc);
+        const socket_dir = try socket.getSocketDir(alloc);
         const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{socket_dir});
         errdefer alloc.free(log_dir);
 
@@ -285,21 +323,6 @@ const Cfg = struct {
         try cfg.mkdir();
 
         return cfg;
-    }
-
-    fn socketDir(alloc: std.mem.Allocator) ![]const u8 {
-        const tmpdir = std.mem.trimRight(u8, posix.getenv("TMPDIR") orelse "/tmp", "/");
-        const uid = posix.getuid();
-
-        const socket_dir: []const u8 = if (posix.getenv("ZMX_DIR")) |zmxdir|
-            try alloc.dupe(u8, zmxdir)
-        else if (posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime|
-            try std.fmt.allocPrint(alloc, "{s}/zmx", .{xdg_runtime})
-        else
-            try std.fmt.allocPrint(alloc, "{s}/zmx-{d}", .{ tmpdir, uid });
-        errdefer alloc.free(socket_dir);
-
-        return socket_dir;
     }
 
     pub fn deinit(self: *Cfg, alloc: std.mem.Allocator) void {
@@ -877,6 +900,9 @@ fn printCompletions(shell: completions.Shell) !void {
 }
 
 fn help() !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+
     const help_text =
         \\zmx - session persistence for terminal processes
         \\
@@ -884,6 +910,16 @@ fn help() !void {
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
+    ;
+    try w.interface.print(help_text, .{});
+
+    if (build_options.enable_zmosh) {
+        try w.interface.print("\n  [a]ttach -r <host> <name>        Attach to remote UDP session", .{});
+        try w.interface.print("\n  [s]erve <name>                   Start remote gateway for a session", .{});
+    }
+
+    const help_text_rest =
+        \\
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  [l]ist [--short]               List active sessions
@@ -903,9 +939,7 @@ fn help() !void {
         \\  - ZMX_SESSION_PREFIX   Adds this value to the start of every session name for all commands
         \\
     ;
-    var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print(help_text, .{});
+    try w.interface.print(help_text_rest, .{});
     try w.interface.flush();
 }
 
@@ -1724,6 +1758,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
                     // Broadcast data to all clients
                     for (daemon.clients.items) |client| {
+                        if (!client.initialized) continue;
                         if (vt_stream.handler.clear_detected) {
                             ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, "\x1b[22J") catch {};
                         }

@@ -23,9 +23,12 @@ pub fn build(b: *std.Build) void {
         .Inherit,
     ) catch "unknown", "\n");
 
+    const enable_zmosh = b.option(bool, "enable-zmosh", "Enable zmosh remote UDP session support") orelse false;
+
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_sha", git_sha);
+    options.addOption(bool, "enable_zmosh", enable_zmosh);
     const ghostty_ver = @import("build.zig.zon").dependencies.ghostty.hash;
     options.addOption([]const u8, "ghostty_version", ghostty_ver);
 
@@ -35,6 +38,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.addOptions("build_options", options);
+
+    if (enable_zmosh) {
+        const zmosh_mod = b.createModule(.{
+            .root_source_file = b.path("contrib/zmosh/src/mod.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        exe_mod.addImport("zmosh", zmosh_mod);
+    }
 
     if (b.lazyDependency("ghostty", .{
         .target = target,
